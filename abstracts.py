@@ -16,14 +16,6 @@ class AbstractCardManager(ABC):
     """
 
     @abstractmethod
-    def __init__(self, json_file: str, input_directory: str) -> None:
-        self.dict_of_cards: dict[int, Card] = {}
-        self.json_file = json_file
-        self.input_directory = input_directory
-        self.load_cards()
-        ...
-
-    @abstractmethod
     def load_cards(self) -> None:
         """Loads all the cards from the json file into dict"""
         ...
@@ -36,16 +28,6 @@ class AbstractCardManager(ABC):
 
 class AbstractPlayer(ABC):
     """Player"""
-
-    @abstractmethod
-    def __init__(self, name: str, nature: str | None, temperature: float | None) -> None:
-        """set how the player will behave"""
-        self.nature = nature
-        self.temperature = temperature
-        self.name = name
-        self.cards_on_hand: list[Card] = []
-        self.score: int = 0
-        ...
 
     @abstractmethod
     def take_card(self, card: Card) -> None:

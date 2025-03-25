@@ -16,7 +16,7 @@ class AbstractCardManager(ABC):
     """
 
     @abstractmethod
-    def load_cards(self) -> None:
+    def _load_cards(self) -> None:
         """Loads all the cards from the json file into dict"""
         ...
 

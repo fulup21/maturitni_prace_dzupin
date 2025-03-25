@@ -1,7 +1,8 @@
 from random import shuffle, choice
 import os
+from typing import Any
 from abstracts import AbstractCardManager, AbstractPlayer, Card
-from import_images import process_images_to_json
+from image_importer import process_images_to_json
 from sk import mykey
 import openai
 import json
@@ -12,8 +13,8 @@ import logging
 import threading
 import base64
 import hashlib
+import platform
 
-openai.api_key = mykey  # OpenAI API key
 
 logging.basicConfig(filename='dixit.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                     filemode='w', encoding='utf-8')  # 'w' write mode or 'a' append mode
@@ -30,18 +31,18 @@ class CardManager(AbstractCardManager):
         self.dict_of_cards: dict[int, Card] = {}
         self.json_file = json_file
         self.input_directory = input_directory
-        self.load_cards()
+        self._load_cards()
 
-    def load_cards(self) -> None:
+    def _load_cards(self) -> None:
         """Loads all the cards from the json file into dict"""
         try:
             with open(self.json_file, "r", encoding="utf-8") as f:
-                data:list = json.load(f)
+                data:list[Any] = json.load(f)
             # Validate contents
             if not isinstance(data, list) or not all(
                     'key' in item and 'path' in item and 'checksum' in item and 'encoded_picture' in item for item in
                     data):
-                raise ValueError("obsah JSONu je chybný")
+                raise ValueError(f"obsah JSONu {self.json_file} je chybný")
 
             # Check if the number of items in the JSON file matches the number of files in the directory
             num_files_in_directory = len([name for name in os.listdir(self.input_directory) if os.path.isfile(os.path.join(self.input_directory, name))])
@@ -66,7 +67,7 @@ class CardManager(AbstractCardManager):
         except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
             log.info(f"Chyba se souborem '{self.json_file}': {e}. Regeneruji...")
             process_images_to_json(self.input_directory, self.json_file)
-            self.load_cards()  # Retry loading after regeneration
+            self._load_cards()  # Retry loading after regeneration
 
     def find_card(self, key: int) -> Card:
         """find a card by key"""
@@ -121,16 +122,14 @@ class Player(AbstractPlayer):
             n=1,
             temperature=self.temperature
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        return content if content else "Neumím vymyslet popis"
 
     def choose_card(self, description: str, laid_out_cards: list[Card]) -> Card:
         """look at all cards 'on the table' and compare them with the description"""
 
         prompt = f"Na základě zadaných obrázků vyber ten, který nejlépe sedí zadanému popisu:{description}. Napiš mi pouze číslo karty ve formatu:1"
-        built_message:list[dict[str,str|dict[str,str]]] = [{
-            "type": "text",
-            "text": prompt,
-        }]
+        built_message:list[dict[str,str]|dict[str,Any]] = []
         for i in range(len(laid_out_cards)):
             g = {"type": "image_url",
                  "image_url": {
@@ -147,14 +146,15 @@ class Player(AbstractPlayer):
                 },
                 {
                     "role": "user",
-                    "content": built_message,
+                    "content": [{"type": "text", "text": prompt}] + built_message,
                 }
             ],
             max_tokens=300,
             n=1,
             temperature=self.temperature
         )
-        return laid_out_cards[int(response.choices[0].message.content) - 1]
+        content = response.choices[0].message.content
+        return laid_out_cards[int(content) - 1] if content else choice(laid_out_cards)
 
     def score_add(self, number: int) -> None:
         self.score += number
@@ -180,20 +180,25 @@ class DixitGame:
         self.round_number: int = 1
         self.index_storyteller: int = 0
         self.manager = CardManager("images.json", "card_images")
-        self.shuffle_cards()
-        self.hand_out_cards()
+        self._shuffle_cards()
+        self._hand_out_cards()
+        if not self.debug:
+            openai.api_key = mykey  # OpenAI API key
 
         ################################ UI SETUP ###################################
         # Initialize UI components
         self.backgrounds: list[str] = ['dodger blue', 'IndianRed1', 'slate blue', 'PaleGreen1']
-        self.card_images: list[ImageTk] = []
+        self.card_images: list[ImageTk.PhotoImage] = []
 
 
         # Set up the main Tkinter window
         self.root = root_window
         self.root.geometry("1920x1200")
         self.root.title("Dixit Game")
-        self.root.state("zoomed")
+        if platform.system() == "Windows":
+            self.root.state("zoomed")
+        else:
+            self.root.attributes("-zoomed", True)
 
         self.canvas = Canvas(self.root)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -209,12 +214,12 @@ class DixitGame:
         self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Big button to start the game, gets deleted after the first turn
-        self.start_game_button = tk.Button(self.canvas, text='Začít hru', font=("Arial", 60), command=self.play_turn)
+        self.start_game_button = tk.Button(self.canvas, text='Začít hru', font=("Arial", 60), command=self._play_turn)
         self.start_game_button.place(relx=0.5, rely=0.7, anchor=tk.CENTER)
 
-        self.play_button = tk.Button(self.bottom_bar, text='Zahraj další tah', command=self.play_turn)
+        self.play_button = tk.Button(self.bottom_bar, text='Zahraj další tah', command=self._play_turn)
 
-        self.log_button = tk.Button(self.bottom_bar, text="Log", command=self.show_log)
+        self.log_button = tk.Button(self.bottom_bar, text="Log", command=self._show_log)
         self.log_button.pack(side=tk.LEFT, padx=2, pady=1)
 
         # Log player creation
@@ -226,79 +231,84 @@ class DixitGame:
             
         storyteller: Player = self.players[storyteller_idx]
         storyteller_card: Card = storyteller.cards_on_hand[0]  # storyteller chooses a card
-
         self.cards_on_table.append((storyteller_card, storyteller))
-        
+        description:str
         voting: list[tuple[Player, Card]] = []
 
         if self.debug:
             # Simulate turn in debug mode
-            description:str = "Sample popis dlouhý bla bla bla"
+            description = "Sample popis dlouhý bla bla bla"
             log.info(f"Vypraveč: {storyteller.name}")
             log.info(f"Vybraná karta: {storyteller_card.key}, Popis: {description}")
-            for player in self.players:
+            self._simulated_game_turn(storyteller, storyteller_card, description, voting)
+            
+
+        else:
+            # Normal game flow with threads
+            description = storyteller.make_description(storyteller_card)
+            log.info(f"Vypraveč: {storyteller.name}")
+            log.info(f"Vybraná karta: {storyteller_card.key}, Popis: {description}")
+            self._real_game_turn(storyteller, storyteller_card, description, voting)
+
+        # Show the updated UI
+        self._update_ui(storyteller, storyteller_card, description, voting)
+        # Remove cards from players' hands, clear cards on the table and give a new card to the players
+        self._prepare_next_round()
+
+    def _simulated_game_turn(self,storyteller: Player, storyteller_card: Card, description: str, voting: list[tuple[Player, Card]]) -> None:
+        for player in self.players:
                 if player != storyteller:
                     chosen_card = choice(player.cards_on_hand)
                     logging.info(
                         f"Hrac {player.name} vybral k popisu {description} kartu: {chosen_card.key} a vylozil ji na stul")
                     self.cards_on_table.append((chosen_card, player))
 
-            shuffle(self.cards_on_table)
+        shuffle(self.cards_on_table)
 
-            # Simulate voting
+        # Simulate voting
 
-            for player in self.players:
-                if player != storyteller:
-                    list_without_players_card = [card for card in self.cards_on_table if card[1] != player]
-                    chosen_card = choice(list_without_players_card)[0]
-                    log.info(f"Hrac {player.name} hlasoval pro kartu: {chosen_card.key}")
-                    voting.append((player, chosen_card))
+        for player in self.players:
+            if player != storyteller:
+                list_without_players_card = [card for card in self.cards_on_table if card[1] != player]
+                chosen_card = choice(list_without_players_card)[0]
+                log.info(f"Hrac {player.name} hlasoval pro kartu: {chosen_card.key}")
+                voting.append((player, chosen_card))
 
-            self.calculate_scores(voting, storyteller, storyteller_card)
+        self._calculate_scores(voting, storyteller, storyteller_card)
+    
+    def _real_game_turn(self, storyteller: Player, storyteller_card: Card, description: str, voting: list[tuple[Player, Card]]) -> None:
+        threads: list[threading.Thread] = []
+        for player in self.players: 
+            thread = threading.Thread(target=self._choose_card_thread, args=(player, storyteller, description,))
+            threads.append(thread)
+            thread.start()
 
-        else:
-            # Normal game flow with threads
-            description: str = storyteller.make_description(storyteller_card)
-            log.info(f"Vypraveč: {storyteller.name}")
-            log.info(f"Vybraná karta: {storyteller_card.key}, Popis: {description}")
+        for thread in threads: # Wait for all threads to finish
+            thread.join()
 
-            threads: list[threading.Thread] = []
-            for player in self.players: #https://stackoverflow.com/questions/55529319/how-to-create-multiple-threads-dynamically-in-python
-                thread = threading.Thread(target=self.choose_card_thread, args=(player, storyteller, description,))
-                threads.append(thread)
-                thread.start()
+        shuffle(self.cards_on_table)
 
-            for thread in threads: # Wait for all threads to finish
-                thread.join()
+        # Players except storyteller vote
 
-            shuffle(self.cards_on_table)
+        vote_threads: list[threading.Thread] = []
+        for player in self.players:
+            thread = threading.Thread(target=self._vote_thread, args=(player, storyteller, description, voting,))
+            vote_threads.append(thread)
+            thread.start()
 
-            # Players except storyteller vote
+        for thread in vote_threads: # Wait for all threads to finish
+            thread.join()
 
-            vote_threads: list[threading.Thread] = []
-            for player in self.players:
-                thread = threading.Thread(target=self.vote_thread, args=(player, storyteller, description, voting,))
-                vote_threads.append(thread)
-                thread.start()
+        self._calculate_scores(voting, storyteller, storyteller_card)
 
-            for thread in vote_threads: # Wait for all threads to finish
-                thread.join()
-
-            self.calculate_scores(voting, storyteller, storyteller_card)
-
-        # Show the updated UI
-        self.update_ui(storyteller, storyteller_card, description, voting)
-        # Remove cards from players' hands, clear cards on the table and give a new card to the players
-        self.prepare_next_round()
-
-    def choose_card_thread(self, player: Player, storyteller: Player, description: str) -> None:
+    def _choose_card_thread(self, player: Player, storyteller: Player, description: str) -> None:
         # Thread for player to choose a card
         if player is not storyteller:
             chosen_card = player.choose_card(description, player.cards_on_hand)
             self.cards_on_table.append((chosen_card, player))
             log.info(f"Hráč {player.name} vybral k popisu {description} kartu: {chosen_card.key} a vyložil ji na stůl")
 
-    def vote_thread(self, player: Player, storyteller: Player, description: str, voting: list[tuple[Player, Card]]) -> None:
+    def _vote_thread(self, player: Player, storyteller: Player, description: str, voting: list[tuple[Player, Card]]) -> None:
         # Thread for player to vote for a card
         if player is not storyteller:
             choices = [k[0] for k in self.cards_on_table if k[1] != player] # Cards that are on the table, except the choosing player's card
@@ -307,7 +317,7 @@ class DixitGame:
             log.info(f"Hráč {player.name} hlasoval pro kartu: {chosen_card.key}")
 
 
-    def prepare_next_round(self) -> None:
+    def _prepare_next_round(self) -> None:
         # Remove selected cards from players' hands after updating the canvas
         for player in self.players:
             for chosen_card, _ in self.cards_on_table:
@@ -326,7 +336,7 @@ class DixitGame:
         for player in self.players:
             player.take_card(self.cards_in_deck.pop(0))
 
-    def calculate_scores(self, voting: list[tuple[Player, Card]], storyteller: Player, storyteller_card: Card) -> None:
+    def _calculate_scores(self, voting: list[tuple[Player, Card]], storyteller: Player, storyteller_card: Card) -> None:
         """Calculate scores for the round according to the Dixit rules:
          1. If everyone or no one guessed correctly, add 2 points to everyone except storyteller
          2. If someone guessed correctly, add 3 points to storyteller and 3 points to the correct guesser
@@ -352,11 +362,11 @@ class DixitGame:
                 player.score_add(for_voted)
                 log.info(f'Hráč {player.name} získal {for_voted} body')
 
-    def preview(self) -> None:
+    def _preview(self) -> None:
         # Preview the game state before the turn
         self.canvas.update()
         self.start_game_button.destroy()
-        self.clear_widget_from_bottom_bar()
+        self._clear_widget_from_bottom_bar()
         self.canvas.delete('all')
         self.canvas.pack(fill=tk.BOTH, expand=True)
         canvas_width = self.canvas.winfo_width()
@@ -387,7 +397,7 @@ class DixitGame:
             for card_idx, card in enumerate(player.cards_on_hand):
                 x = x_offset + card_idx * 90
                 y = y_offset
-                image = Image.open(card.path)
+                image: Image.Image = Image.open(card.path)
                 image = image.resize((80, 120))
                 card_image = ImageTk.PhotoImage(image)
                 self.canvas.create_image(x + 40, y + 60, image=card_image)
@@ -395,13 +405,13 @@ class DixitGame:
 
         self.canvas.update()
 
-    def shuffle_cards(self) -> None:
+    def _shuffle_cards(self) -> None:
         for item in self.manager.dict_of_cards:
             self.cards_in_deck.append(self.manager.dict_of_cards[item])
         shuffle(self.cards_in_deck)
         log.info("Karty byly zamíchány")
 
-    def hand_out_cards(self) -> None:
+    def _hand_out_cards(self) -> None:
         log.info("Karty byly rozdány")
         # Ensure there are enough cards in the deck
         if len(self.cards_in_deck) < self.number_of_players * self.number_of_cards_per_player:
@@ -412,7 +422,7 @@ class DixitGame:
                 player.take_card(self.cards_in_deck.pop(0))  # Take a card from the deck and give it to the player
 
 
-    def play_turn(self) -> None:
+    def _play_turn(self) -> None:
         # After pressing button, check if game is over or play turn
         self.play_button.config(state=tk.DISABLED)
         self.log_button.config(state=tk.DISABLED)
@@ -422,9 +432,9 @@ class DixitGame:
         self.play_button.pack(side=tk.RIGHT, padx=10, pady=10)
         max_score = max(player.score for player in self.players)
         if max_score >= 30:
-            self.game_end(max_score)
+            self._game_end(max_score)
         else:
-            self.preview()
+            self._preview()
 
             if not self.debug:
                 self.turn(self.index_storyteller)
@@ -438,9 +448,9 @@ class DixitGame:
             self.play_button.config(state=tk.NORMAL)
             self.log_button.config(state=tk.NORMAL)
 
-    def update_ui(self, storyteller: Player, storyteller_card: Card, description: str,
+    def _update_ui(self, storyteller: Player, storyteller_card: Card, description: str,
                   voting: list[tuple[Player, Card]]) -> None:
-        self.clear_widget_from_bottom_bar()
+        self._clear_widget_from_bottom_bar()
         self.canvas.delete('all')
         self.canvas.pack(fill=tk.BOTH, expand=True)
         canvas_width = self.canvas.winfo_width()
@@ -504,12 +514,13 @@ class DixitGame:
                                bg='lightgrey', font=('Arial', 12, 'bold'))
         footer_text.pack(side=tk.BOTTOM, pady=10)
         self.canvas.update()
-    def clear_widget_from_bottom_bar(self)-> None:
+
+    def _clear_widget_from_bottom_bar(self)-> None:
         for widget in self.bottom_bar.winfo_children(): # Remove existing labels from the bottom bar
             if isinstance(widget, tk.Label):
                 widget.destroy()
 
-    def show_log(self) -> None:
+    def _show_log(self) -> None:
         log_window = tk.Toplevel(self.root)
         log_window.title("Log")
 
@@ -570,7 +581,7 @@ class DixitGame:
         close_button = tk.Button(button_frame, text="Zavřít", command=log_window.destroy)
         close_button.pack(pady=10, padx=5)
 
-    def game_end(self, max_score: int) -> None:
+    def _game_end(self, max_score: int) -> None:
         winners = [hrac for hrac in self.players if hrac.score == max_score]
         winner_names = ', '.join(hrac.name for hrac in winners)
         if len(winners) > 1:
@@ -578,10 +589,10 @@ class DixitGame:
         else:
             message = f"Konec hry, vyhrál hráč {winner_names} s {max_score} body."
         log.info(message)
-        self.display_winner_message(message)
+        self._display_winner_message(message)
 
-    def display_winner_message(self, message: str) -> None:
-        self.clear_widget_from_bottom_bar()
+    def _display_winner_message(self, message: str) -> None:
+        self._clear_widget_from_bottom_bar()
         self.canvas.delete('all')
         self.canvas.create_text(self.canvas.winfo_width() // 2, self.canvas.winfo_height() // 2, text=message,
                                 font=("Arial", 24), anchor=tk.CENTER)
